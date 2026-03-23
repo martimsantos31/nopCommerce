@@ -4,8 +4,14 @@ services:
         container_name: nopcommerce
         ports:
             - "80:80"
+        environment:
+            # OpenTelemetry configuration
+            OpenTelemetry__OtlpEndpoint: "http://jaeger:4317"
         depends_on:
             - nopcommerce_database
+            - jaeger
+        restart: unless-stopped
+
     nopcommerce_database:
         image: "mcr.microsoft.com/mssql/server:2019-latest"
         container_name: nopcommerce_mssql_server
@@ -13,6 +19,51 @@ services:
             SA_PASSWORD: "nopCommerce_db_password"
             ACCEPT_EULA: "Y"
             MSSQL_PID: "Express"
+        volumes:
+            - nopcommerce_data:/var/opt/mssql
+
+    # --- Observability Stack ---
+
+    jaeger:
+        image: jaegertracing/all-in-one:latest
+        container_name: jaeger
+        environment:
+            COLLECTOR_OTLP_ENABLED: "true"
+            # Enable Prometheus metrics endpoint on Jaeger
+            METRICS_STORAGE_TYPE: "prometheus"
+            PROMETHEUS_SERVER_URL: "http://prometheus:9090"
+        ports:
+            - "16686:16686"   # Jaeger UI
+            - "4317:4317"     # OTLP gRPC receiver
+            - "4318:4318"     # OTLP HTTP receiver
+        restart: unless-stopped
+
+    prometheus:
+        image: prom/prometheus:v2.54.0
+        container_name: prometheus
+        volumes:
+            - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+        ports:
+            - "9090:9090"
+        restart: unless-stopped
+
+    grafana:
+        image: grafana/grafana:11.2.0
+        container_name: grafana
+        environment:
+            GF_SECURITY_ADMIN_USER: admin
+            GF_SECURITY_ADMIN_PASSWORD: admin
+            GF_AUTH_ANONYMOUS_ENABLED: "true"
+            GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+        volumes:
+            - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+            - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+        ports:
+            - "3001:3000"
+        depends_on:
+            - jaeger
+            - prometheus
+        restart: unless-stopped
 
 volumes:
-  nopcommerce_data:            
+    nopcommerce_data:

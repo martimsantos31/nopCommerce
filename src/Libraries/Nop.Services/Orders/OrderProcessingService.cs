@@ -1,4 +1,6 @@
-﻿using System.Globalization;
+﻿using System.Diagnostics;
+using System.Diagnostics.Metrics;
+using System.Globalization;
 using Newtonsoft.Json;
 using Nop.Core;
 using Nop.Core.Caching;
@@ -40,6 +42,17 @@ namespace Nop.Services.Orders;
 public partial class OrderProcessingService : IOrderProcessingService
 {
     #region Fields
+
+    // OpenTelemetry instrumentation — uses .NET BCL types only (System.Diagnostics).
+    // Source name must match what is registered via AddSource() in ObservabilityStartup.
+    private static readonly ActivitySource _activitySource = new("NopCommerce.Checkout");
+    private static readonly Meter _meter = new("NopCommerce.Checkout");
+    private static readonly Histogram<double> _stepDuration = _meter.CreateHistogram<double>(
+        "nopcommerce.checkout.step.duration", "ms",
+        "Duration of individual checkout pipeline steps");
+    private static readonly Counter<long> _outcomeCounter = _meter.CreateCounter<long>(
+        "nopcommerce.checkout.outcome", "{outcome}",
+        "Count of checkout attempts by outcome");
 
     protected readonly CurrencySettings _currencySettings;
     protected readonly IAddressService _addressService;
@@ -1571,8 +1584,37 @@ public partial class OrderProcessingService : IOrderProcessingService
         if (processPaymentRequest.OrderGuid == Guid.Empty)
             throw new Exception("Order GUID is not generated");
 
+        // --- OTel: top-level span for the entire checkout pipeline ---
+        using var checkoutActivity = _activitySource.StartActivity("Checkout PlaceOrder", ActivityKind.Server);
+        checkoutActivity?.SetTag("order.guid", processPaymentRequest.OrderGuid.ToString());
+        checkoutActivity?.SetTag("payment.method", processPaymentRequest.PaymentMethodSystemName);
+        checkoutActivity?.SetTag("store.id", processPaymentRequest.StoreId);
+        var checkoutStopwatch = Stopwatch.StartNew();
+
         //prepare order details
-        var details = await PreparePlaceOrderDetailsAsync(processPaymentRequest);
+        PlaceOrderContainer details;
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            using var validateActivity = _activitySource.StartActivity("Checkout Validate");
+            details = await PreparePlaceOrderDetailsAsync(processPaymentRequest);
+            validateActivity?.SetTag("cart.item_count", details.Cart.Count);
+            validateActivity?.SetTag("cart.is_recurring", details.IsRecurringShoppingCart);
+        }
+        catch (Exception ex)
+        {
+            _stepDuration.Record(sw.Elapsed.TotalMilliseconds, new KeyValuePair<string, object>("step", "validate"));
+            checkoutActivity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+            checkoutActivity?.AddEvent(new ActivityEvent("exception",
+                    tags: new ActivityTagsCollection(new List<KeyValuePair<string, object?>>
+                    {
+                        new("exception.type", ex.GetType().FullName),
+                        new("exception.message", ex.Message)
+                    })));
+            _outcomeCounter.Add(1, new KeyValuePair<string, object>("outcome", "validation_failed"));
+            throw;
+        }
+        _stepDuration.Record(sw.Elapsed.TotalMilliseconds, new KeyValuePair<string, object>("step", "validate"));
 
         async Task<PlaceOrderResult> placeOrder(PlaceOrderContainer placeOrderContainer)
         {
@@ -1580,18 +1622,48 @@ public partial class OrderProcessingService : IOrderProcessingService
 
             try
             {
-                var processPaymentResult =
-                    await GetProcessPaymentResultAsync(processPaymentRequest, placeOrderContainer)
-                    ?? throw new NopException("processPaymentResult is not available");
+                // --- OTel: payment processing span ---
+                ProcessPaymentResult processPaymentResult;
+                sw = Stopwatch.StartNew();
+                {
+                    using var paymentActivity = _activitySource.StartActivity("Checkout ProcessPayment");
+                    paymentActivity?.SetTag("payment.method", processPaymentRequest.PaymentMethodSystemName);
+
+                    processPaymentResult =
+                        await GetProcessPaymentResultAsync(processPaymentRequest, placeOrderContainer)
+                        ?? throw new NopException("processPaymentResult is not available");
+
+                    paymentActivity?.SetTag("payment.success", processPaymentResult.Success);
+                    paymentActivity?.SetTag("payment.status", processPaymentResult.NewPaymentStatus.ToString());
+                    if (!processPaymentResult.Success)
+                        paymentActivity?.SetStatus(ActivityStatusCode.Error, "Payment processing failed");
+                }
+                _stepDuration.Record(sw.Elapsed.TotalMilliseconds, new KeyValuePair<string, object>("step", "process_payment"));
 
                 if (processPaymentResult.Success)
                 {
-                    var order = await SaveOrderDetailsAsync(processPaymentRequest, processPaymentResult,
-                        placeOrderContainer);
-                    result.PlacedOrder = order;
+                    // --- OTel: save order details span ---
+                    Order order;
+                    sw = Stopwatch.StartNew();
+                    {
+                        using var saveActivity = _activitySource.StartActivity("Checkout SaveOrder");
+                        order = await SaveOrderDetailsAsync(processPaymentRequest, processPaymentResult,
+                            placeOrderContainer);
+                        result.PlacedOrder = order;
+                        saveActivity?.SetTag("order.id", order.Id);
+                    }
+                    _stepDuration.Record(sw.Elapsed.TotalMilliseconds, new KeyValuePair<string, object>("step", "save_order"));
 
-                    //move shopping cart items to order items
-                    await MoveShoppingCartItemsToOrderItemsAsync(placeOrderContainer, order);
+                    // --- OTel: move cart items + inventory adjustment span ---
+                    sw = Stopwatch.StartNew();
+                    {
+                        using var moveActivity = _activitySource.StartActivity("Checkout MoveItemsAndInventory");
+                        moveActivity?.SetTag("cart.item_count", placeOrderContainer.Cart.Count);
+
+                        //move shopping cart items to order items
+                        await MoveShoppingCartItemsToOrderItemsAsync(placeOrderContainer, order);
+                    }
+                    _stepDuration.Record(sw.Elapsed.TotalMilliseconds, new KeyValuePair<string, object>("step", "move_items_and_inventory"));
 
                     //discount usage history
                     await SaveDiscountUsageHistoryAsync(placeOrderContainer, order);
@@ -1613,7 +1685,7 @@ public partial class OrderProcessingService : IOrderProcessingService
                         string.Format(await _localizationService.GetResourceAsync("ActivityLog.PublicStore.PlaceOrder"),
                             order.Id), order);
 
-                    //raise event       
+                    //raise event
                     await _eventPublisher.PublishAsync(new OrderPlacedEvent(order));
 
                     //check order status
@@ -1621,6 +1693,11 @@ public partial class OrderProcessingService : IOrderProcessingService
 
                     if (order.PaymentStatus == PaymentStatus.Paid)
                         await ProcessOrderPaidAsync(order);
+
+                    // --- OTel: record successful outcome ---
+                    checkoutActivity?.SetTag("order.id", order.Id);
+                    checkoutActivity?.SetStatus(ActivityStatusCode.Ok);
+                    _outcomeCounter.Add(1, new KeyValuePair<string, object>("outcome", "success"));
                 }
                 else
                 {
@@ -1629,16 +1706,33 @@ public partial class OrderProcessingService : IOrderProcessingService
                         result.AddError(string.Format(
                             await _localizationService.GetResourceAsync("Checkout.PaymentError"), paymentError));
                     }
+
+                    // --- OTel: record payment failure ---
+                    checkoutActivity?.SetStatus(ActivityStatusCode.Error, "Payment failed");
+                    _outcomeCounter.Add(1, new KeyValuePair<string, object>("outcome", "payment_failed"));
                 }
             }
             catch (Exception exc)
             {
                 await _logger.ErrorAsync(exc.Message, exc);
                 result.AddError(exc.Message);
+
+                // --- OTel: record exception ---
+                checkoutActivity?.SetStatus(ActivityStatusCode.Error, exc.Message);
+                checkoutActivity?.AddEvent(new ActivityEvent("exception",
+                    tags: new ActivityTagsCollection(new List<KeyValuePair<string, object?>>
+                    {
+                        new("exception.type", exc.GetType().FullName),
+                        new("exception.message", exc.Message)
+                    })));
+                _outcomeCounter.Add(1, new KeyValuePair<string, object>("outcome", "error"));
             }
 
             if (result.Success)
+            {
+                _stepDuration.Record(checkoutStopwatch.Elapsed.TotalMilliseconds, new KeyValuePair<string, object>("step", "total"));
                 return result;
+            }
 
             //log errors
             var logError = result.Errors.Aggregate("Error while placing order. ",
@@ -1646,6 +1740,7 @@ public partial class OrderProcessingService : IOrderProcessingService
             var customer = await _customerService.GetCustomerByIdAsync(processPaymentRequest.CustomerId);
             await _logger.ErrorAsync(logError, customer: customer);
 
+            _stepDuration.Record(checkoutStopwatch.Elapsed.TotalMilliseconds, new KeyValuePair<string, object>("step", "total"));
             return result;
         }
 

@@ -1,0 +1,14 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # Scrape nopCommerce app metrics (exposed by OpenTelemetry Prometheus exporter at /metrics)
+  - job_name: "nopcommerce"
+    static_configs:
+      - targets: ["nopcommerce_web:80"]
+
+  # Scrape Jaeger's internal metrics
+  - job_name: "jaeger"
+    static_configs:
+      - targets: ["jaeger:14269"]

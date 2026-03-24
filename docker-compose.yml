@@ -1,4 +1,4 @@
-services:
+whenservices:
     nopcommerce_web:
         build: .
         container_name: nopcommerce

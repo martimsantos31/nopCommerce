@@ -53,6 +53,18 @@ public partial class OrderProcessingService : IOrderProcessingService
     private static readonly Counter<long> _outcomeCounter = _meter.CreateCounter<long>(
         "nopcommerce.checkout.outcome", "{outcome}",
         "Count of checkout attempts by outcome");
+    private static readonly Histogram<int> _cartSize = _meter.CreateHistogram<int>(
+        "nopcommerce.checkout.cart_size", "{items}",
+        "Number of items per order at checkout");
+    private static readonly Counter<long> _paymentMethodUsage = _meter.CreateCounter<long>(
+        "nopcommerce.checkout.payment_method_usage", "{orders}",
+        "Orders placed by payment method");
+    private static readonly Counter<long> _revenueThroughput = _meter.CreateCounter<long>(
+        "nopcommerce.checkout.revenue", "{cents}",
+        "Cumulative revenue in cents — running sum of order totals");
+    private static readonly Counter<long> _itemsPurchased = _meter.CreateCounter<long>(
+        "nopcommerce.checkout.items_purchased", "{items}",
+        "Units sold per product — enables top-selling product ranking");
 
     protected readonly CurrencySettings _currencySettings;
     protected readonly IAddressService _addressService;
@@ -1339,6 +1351,10 @@ public partial class OrderProcessingService : IOrderProcessingService
 
             await _orderService.InsertOrderItemAsync(orderItem);
 
+            //OTel: record items purchased per product
+            _itemsPurchased.Add(sc.Quantity,
+                new KeyValuePair<string, object>("product_name", product.Name));
+
             //gift cards
             await AddGiftCardsAsync(product, sc.AttributesXml, sc.Quantity, orderItem, scUnitPriceExclTax.price);
 
@@ -1694,10 +1710,14 @@ public partial class OrderProcessingService : IOrderProcessingService
                     if (order.PaymentStatus == PaymentStatus.Paid)
                         await ProcessOrderPaidAsync(order);
 
-                    // --- OTel: record successful outcome ---
+                    // --- OTel: record successful outcome + business metrics ---
                     checkoutActivity?.SetTag("order.id", order.Id);
                     checkoutActivity?.SetStatus(ActivityStatusCode.Ok);
                     _outcomeCounter.Add(1, new KeyValuePair<string, object>("outcome", "success"));
+                    _cartSize.Record(placeOrderContainer.Cart.Count);
+                    _paymentMethodUsage.Add(1, new KeyValuePair<string, object>(
+                        "payment_method", processPaymentRequest.PaymentMethodSystemName ?? "unknown"));
+                    _revenueThroughput.Add((long)(order.OrderTotal * 100));
                 }
                 else
                 {

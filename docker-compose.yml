@@ -42,7 +42,7 @@ services:
         image: prom/prometheus:v2.54.0
         container_name: prometheus
         volumes:
-            - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+            - ./assessment/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
         ports:
             - "9090:9090"
         restart: unless-stopped
@@ -56,8 +56,8 @@ services:
             GF_AUTH_ANONYMOUS_ENABLED: "true"
             GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
         volumes:
-            - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
-            - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+            - ./assessment/observability/grafana/provisioning:/etc/grafana/provisioning:ro
+            - ./assessment/observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
         ports:
             - "3001:3000"
         depends_on:

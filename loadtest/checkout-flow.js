@@ -195,6 +195,9 @@ export default function () {
     { tags: { name: "12_confirm" }, headers: ajaxHeaders(ct) }
   );
 
+  if (confirmRes.body && !confirmRes.body.includes("success")) {
+    console.log(`CONFIRM FAILED: ${(confirmRes.body || "").substring(0, 200)}`);
+  }
   const placed = check(confirmRes, {
     "order placed": (r) =>
       r.status === 200 && r.body && r.body.includes("success"),
